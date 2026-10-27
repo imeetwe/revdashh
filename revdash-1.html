@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>RevDash</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Saira+Condensed:wght@400;600;800&family=Noto+Sans+KR:wght@400;600&display=swap">
+<style>
+/* 레이아웃: 상단 전폭 캔버스 계기판 + 하단 조작 패널. 테슬라 가로 화면 기준, 단일 다크 룩 */
+:root{
+  --bg:#07090c; --panel:#10141a; --line:#1f2630; --fg:#e8edf2; --dim:#7d8896;
+  --accent:#ff4d2e; --ok:#3ddc97; --warn:#ffb020;
+  --f-num:"Saira Condensed","Arial Narrow",sans-serif;
+  --f-ui:"Noto Sans KR",system-ui,sans-serif;
+  color-scheme:dark;
+}
+html,body{background:var(--bg);color:var(--fg);font-family:var(--f-ui);margin:0}
+.wrap{padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:12px;display:grid;gap:12px;max-width:1500px;margin:0 auto}
+canvas{width:100%;display:block;background:radial-gradient(ellipse at 50% 40%,#121820,#07090c 70%);border-radius:14px;border:1px solid var(--line)}
+.bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+button,select{font:600 15px var(--f-ui);color:var(--fg);background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 16px;cursor:pointer;min-height:48px}
+button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff;min-width:140px}
+button.on{border-color:var(--accent);color:var(--accent)}
+.pedal{flex:1 1 140px;font-size:18px;min-height:72px;user-select:none;-webkit-user-select:none;touch-action:none}
+.pedal.gas:active,.pedal.gas.held{background:#3a1710;border-color:var(--accent)}
+.pedal.brk:active,.pedal.brk.held{background:#1b2230}
+label{color:var(--dim);font-size:13px;display:flex;gap:8px;align-items:center}
+input[type=range]{width:140px;accent-color:var(--accent)}
+.status{color:var(--dim);font-size:13px;font-variant-numeric:tabular-nums}
+.status b{color:var(--fg);font-weight:600}
+.spacer{flex:1}
+.note{color:var(--dim);font-size:12px;line-height:1.6;max-width:70ch}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <canvas id="dash" aria-label="가상 계기판"></canvas>
+
+  <div class="bar">
+    <button id="start" class="primary">엔진 시동</button>
+    <button id="modeGps" class="on">GPS 주행</button>
+    <button id="modeDemo">시험 주행</button>
+    <select id="preset" aria-label="엔진 프리셋"></select>
+    <label for="vol">볼륨 <input id="vol" type="range" min="0" max="1" step="0.01" value="0.7"></label>
+    <span class="spacer"></span>
+    <button id="fs">전체화면</button>
+  </div>
+
+  <div class="bar" id="pedals" hidden>
+    <button class="pedal brk" id="brk">브레이크</button>
+    <button class="pedal" id="auto">자동 데모</button>
+    <button class="pedal gas" id="gas">가속</button>
+  </div>
+
+  <div class="status" id="status">대기 중 · 정차 상태에서 「엔진 시동」을 누르세요</div>
+  <p class="note">RPM·기어·수온은 GPS 속도로 계산한 가상 값입니다. 실제 속도는 순정 계기를 확인하세요. 키보드: ↑ 가속, ↓ 브레이크.</p>
+</div>
+
+<script>
+"use strict";
+/* =========================================================
+   1. 엔진 프리셋
+   ========================================================= */
+/* syn: 배기 펄스 합성 파라미터
+   off  : 점화 타이밍 편차(사이클 비율) → 불규칙할수록 '두둥두둥' 럼블
+   amp  : 실린더별 펄스 세기 편차
+   tau  : 펄스 감쇠 시간(ms) — 길수록 묵직
+   r1/r2: 배기 공명 주파수(Hz)와 Q,  pipe: 배기관 지연(ms),  fb: 관 공명 피드백
+   drive: 포화(거칠기),  bright: 고역 개방 정도,  lope: 공회전 캠 울렁임 */
+const PRESETS = {
+  v8m:  {name:"V8 머슬 6.2L", cyl:8, idle:700, red:6500, ratios:[2.66,1.78,1.30,1.00,0.74,0.50], fd:3.42, tire:0.35, pop:1.0,
+         syn:{off:[0,.045,-.025,.06,0,-.05,.03,-.015], amp:[.3,-.15,.2,-.25,.35,-.1,.15,-.2], tau:7, r1:[68,1.4], r2:[165,2.2],
+              pipe:5.5, fb:.45, drive:3.2, bright:.55, lope:.35, direct:.5}},
+  v8x:  {name:"V8 크로스플레인 슈퍼차저", cyl:8, idle:800, red:7000, ratios:[4.02,2.36,1.53,1.15,0.85,0.67], fd:3.42, tire:0.35, pop:0.8, turbo:"sc",
+         syn:{off:[0,.03,-.02,.04,0,-.03,.02,-.01], amp:[.2,-.1,.15,-.15,.25,-.05,.1,-.1], tau:5.5, r1:[80,1.5], r2:[210,2.5],
+              pipe:4.5, fb:.4, drive:3.6, bright:.7, lope:.15, direct:.6}},
+  v10:  {name:"V10 자연흡기", cyl:10, idle:1000, red:8500, ratios:[3.13,2.59,1.96,1.57,1.30,1.12,0.92], fd:3.73, tire:0.34, pop:0.7,
+         syn:{off:[0,.012,-.01,.015,0,-.012,.01,-.008,.012,-.01], amp:[.1,-.05,.08,-.08,.1,-.03,.06,-.06,.05,-.05], tau:3.5, r1:[110,1.6], r2:[320,2.8],
+              pipe:3.2, fb:.35, drive:2.8, bright:1.0, lope:.05, direct:.75}},
+  i6t:  {name:"직렬6 터보", cyl:6, idle:750, red:7200, ratios:[4.71,3.14,2.11,1.67,1.29,1.00,0.84,0.67], fd:3.15, tire:0.34, pop:0.5, turbo:"turbo",
+         syn:{off:[0,.004,-.004,.003,0,-.003], amp:[.05,-.03,.04,-.04,.03,-.02], tau:4, r1:[95,1.6], r2:[260,2.5],
+              pipe:4, fb:.35, drive:2.4, bright:.75, lope:.05, direct:.6}}
+};
+
+/* =========================================================
+   2. 속도 추정 모듈 (MyPilot 로직 교체 지점)
+   ---------------------------------------------------------
+   인터페이스: SpeedSource.onUpdate(cb)  cb({v, a, lat, ts, acc})
+     v  : 속도 m/s,  a : 종가속 m/s²,  lat : 횡가속 m/s²
+     ts : performance.now() 기준 ms,  acc : GPS 정확도 m
+   MyPilot의 속도 처리 함수를 쓰려면 handleFix() 내부만 바꾸면 됨.
+   ========================================================= */
+class Kalman1D {               // 상태 [속도, 가속도]
+  constructor(q=1.5, r=0.6){ this.q=q; this.r=r; this.v=0; this.a=0; this.P=[[4,0],[0,4]]; this.init=false; }
+  step(z, dt, r=this.r){
+    if(!this.init){ this.v=z; this.init=true; return; }
+    const P=this.P, q=this.q;
+    // 예측
+    this.v += this.a*dt;
+    const p00=P[0][0]+dt*(P[1][0]+P[0][1])+dt*dt*P[1][1]+q*dt*dt*dt/3;
+    const p01=P[0][1]+dt*P[1][1]+q*dt*dt/2;
+    const p10=P[1][0]+dt*P[1][1]+q*dt*dt/2;
+    const p11=P[1][1]+q*dt;
+    // 갱신
+    const y=z-this.v, S=p00+r*r, k0=p00/S, k1=p10/S;
+    this.v+=k0*y; this.a+=k1*y;
+    this.P=[[(1-k0)*p00,(1-k0)*p01],[p10-k1*p00,p11-k1*p01]];
+  }
+}
+const toRad=d=>d*Math.PI/180;
+function haversine(a,b){
+  const R=6371000, dLat=toRad(b.lat-a.lat), dLon=toRad(b.lon-a.lon);
+  const h=Math.sin(dLat/2)**2+Math.cos(toRad(a.lat))*Math.cos(toRad(b.lat))*Math.sin(dLon/2)**2;
+  return 2*R*Math.asin(Math.sqrt(h));
+}
+function bearing(a,b){
+  const y=Math.sin(toRad(b.lon-a.lon))*Math.cos(toRad(b.lat));
+  const x=Math.cos(toRad(a.lat))*Math.sin(toRad(b.lat))-Math.sin(toRad(a.lat))*Math.cos(toRad(b.lat))*Math.cos(toRad(b.lon-a.lon));
+  return (Math.atan2(y,x)*180/Math.PI+360)%360;
+}
+const SpeedSource = {
+  kf:new Kalman1D(), last:null, lastHead:null, latA:0, cbs:[], watchId:null,
+  onUpdate(cb){ this.cbs.push(cb); },
+  start(){
+    if(!("geolocation" in navigator)){ setStatus("이 브라우저는 위치 기능을 지원하지 않습니다. 시험 주행을 쓰세요."); return; }
+    this.watchId=navigator.geolocation.watchPosition(p=>this.handleFix(p), e=>{
+      setStatus(e.code===1 ? "위치 권한이 거부됐습니다. 브라우저 설정에서 허용 후 다시 시동하세요." : "GPS 신호 대기 중 ("+e.message+")");
+    },{enableHighAccuracy:true, maximumAge:0, timeout:10000});
+  },
+  stop(){ if(this.watchId!=null) navigator.geolocation.clearWatch(this.watchId); this.watchId=null; this.kf=new Kalman1D(); this.last=null; },
+  handleFix(p){
+    const now=performance.now(), c=p.coords;
+    const fix={lat:c.latitude, lon:c.longitude, t:now};
+    let z=(c.speed!=null && !isNaN(c.speed)) ? c.speed : null;
+    if(this.last){
+      const dt=Math.max(0.05,(now-this.last.t)/1000), d=haversine(this.last,fix);
+      if(z==null) z=d/dt;
+      // 횡가속: 방위 변화율 × 속도 (3m 이상 이동시에만 방위 계산)
+      if(d>3){
+        const h=(c.heading!=null && !isNaN(c.heading)) ? c.heading : bearing(this.last,fix);
+        if(this.lastHead!=null){
+          let dh=h-this.lastHead; dh=((dh+540)%360)-180;
+          this.latA = this.latA*0.5 + 0.5*(toRad(dh)/dt)*this.kf.v;
+        }
+        this.lastHead=h;
+      }
+      // 정차 흔들림 처리: 정확도 대비 이동이 작으면 0
+      if(z<0.8 && d<Math.max(2,c.accuracy*0.3)) z=0;
+      const r=Math.min(3, Math.max(0.3, c.accuracy/10));
+      this.kf.step(z, dt, r);
+      if(this.kf.v<0.3 && z===0){ this.kf.v=0; this.kf.a*=0.5; }
+    } else if(z!=null){ this.kf.step(z,1); }
+    this.last=fix;
+    const out={v:Math.max(0,this.kf.v), a:this.kf.a, lat:this.latA, ts:now, acc:c.accuracy};
+    this.cbs.forEach(cb=>cb(out));
+  }
+};
+
+/* =========================================================
+   3. 주행 모델: 속도·가속 → 스로틀, 기어, RPM
+   ========================================================= */
+const Drive = {
+  P:PRESETS.v10, gear:1, rpm:1000, thr:0, thrPrev:0, popT:0, shiftT:0, limiter:0, coolant:62,
+  setPreset(k){ this.P=PRESETS[k]; this.gear=1; this.rpm=this.P.idle; },
+  wheelRpm(v,g){ return v/(2*Math.PI*this.P.tire)*60*this.P.ratios[g-1]*this.P.fd; },
+  // 가속도로 스로틀 추정: 실측 가속 + 주행저항(구름+공기) 보상
+  estThrottle(v,a){ return Math.max(0,Math.min(1,(a+0.15+0.00045*v*v)/2.6)); },
+  update(v, thrIn, dt){
+    const P=this.P;
+    this.thr += (thrIn-this.thr)*Math.min(1,dt*8);
+    // 오프스로틀 팝 구간
+    if(this.thrPrev>0.45 && this.thr<0.12 && this.rpm>P.red*0.45) this.popT=0.9;
+    this.thrPrev=this.thr;
+    this.popT=Math.max(0,this.popT-dt); this.shiftT=Math.max(0,this.shiftT-dt);
+    // 변속
+    const n=P.ratios.length;
+    const upAt=P.red*(0.42+0.5*this.thr), downAt=P.idle*1.3+this.thr*P.red*0.25;
+    if(this.shiftT===0){
+      if(this.wheelRpm(v,this.gear)>upAt && this.gear<n){ this.gear++; this.shiftT=0.35; this.popT=Math.max(this.popT,0.12); }
+      else if(this.gear>1 && this.wheelRpm(v,this.gear)<downAt){ this.gear--; this.shiftT=0.35; this.blip=0.2; }
+    }
+    if(v<1.5) this.gear=1;
+    // 목표 RPM (저속 반클러치 구간 포함)
+    let target=this.wheelRpm(v,this.gear);
+    const slip=P.idle+this.thr*P.red*0.35;
+    if(this.gear===1 && target<slip) target=Math.max(target,slip);
+    target=Math.max(P.idle,target);
+    if(this.blip>0){ target+=900; this.blip-=dt; }
+    this.rpm += (target-this.rpm)*Math.min(1,dt*(this.shiftT>0?18:9));
+    // 레브 리미터
+    if(this.rpm>P.red){ this.rpm=P.red-120; this.limiter=0.06; }
+    this.limiter=Math.max(0,this.limiter-dt);
+    // 가상 수온: 시동 후 서서히 90℃
+    this.coolant += (90+this.thr*3-this.coolant)*dt*0.01;
+  }
+};
+
+/* =========================================================
+   4. 엔진음 합성 — 배기 펄스 방식
+   ---------------------------------------------------------
+   점화 1회 = 배기 펄스 1개. 펄스 → 배기 공명 2개 → 배기관 콤필터
+   → 포화 → 2단 로우패스. 오디오 스레드(AudioWorklet)에서 샘플 단위로 생성.
+   ========================================================= */
+const SYNTH_SRC = String.raw`
+class ExhaustSynth{
+  constructor(sr){
+    this.sr=sr; this.ph=0; this.rpm=800; this.thr=0; this.tRpm=800; this.tThr=0;
+    this.pop=0; this.cut=0; this.env=0; this.crk=0; this.cfg=null; this.red=7000;
+    this.buf=new Float32Array(4096); this.w=0; this.lp1=0; this.lp2=0; this.dcx=0; this.dcy=0;
+    this.b1=[0,0,0,0]; this.b2=[0,0,0,0]; this.seed=12345; this.jit=[];
+  }
+  rnd(){ this.seed=(this.seed*1664525+1013904223)>>>0; return this.seed/4294967296; }
+  bp(f,q){ const w=2*Math.PI*f/this.sr, a=Math.sin(w)/(2*q), a0=1+a;
+    return {b0:a/a0, b2:-a/a0, a1:-2*Math.cos(w)/a0, a2:(1-a)/a0}; }
+  setCfg(c,red){
+    this.cfg=c; this.red=red; this.k1=this.bp(c.r1[0],c.r1[1]); this.k2=this.bp(c.r2[0],c.r2[1]);
+    this.L=Math.min(4000,Math.round(c.pipe*this.sr/1000));
+    const n=c.off.length; this.ev=[];
+    for(let i=0;i<n;i++) this.ev.push({p:((i+c.off[i])/n+1)%1, a:1+c.amp[i]});
+    this.jit=this.ev.map(()=>0); this.tn=Math.tanh(c.drive);
+  }
+  set(m){ this.tRpm=m.rpm; this.tThr=m.thr; this.pop=m.pop; this.cut=m.cut; }
+  biq(k,s,x){ const y=k.b0*x+k.b2*s[1]-k.a1*s[2]-k.a2*s[3]; s[1]=s[0]; s[0]=x; s[3]=s[2]; s[2]=y; return y; }
+  render(out,n){
+    const c=this.cfg; if(!c){ out.fill(0); return; }
+    const sr=this.sr, sm=1-Math.exp(-1/(0.015*sr));
+    // 블록 단위 계수
+    const fc=Math.min(sr*0.45,(260+this.rpm*0.42+this.thr*1500)*c.bright+120);
+    const la=1-Math.exp(-2*Math.PI*fc/sr);
+    const rn=this.rpm/this.red;
+    // 펄스 감쇠는 점화 간격의 1/3을 넘지 않게 — 고회전에서 펄스가 뭉개져 DC가 되는 것 방지
+    const period=120000/(Math.max(300,this.rpm)*c.off.length);
+    const tau=Math.min(c.tau*(1.15-0.55*rn)*(0.85+0.3*this.thr), period*0.33);
+    const dec=Math.exp(-1000/(tau*sr));
+    const drv=c.drive*(0.75+0.6*this.thr);
+    const tn=Math.tanh(drv);
+    const idleness=Math.max(0,1-(this.rpm-0)/(this.red*0.35));
+    const overrun=this.thr<0.12 && rn>0.35;
+    for(let i=0;i<n;i++){
+      this.rpm+=(this.tRpm-this.rpm)*sm; this.thr+=(this.tThr-this.thr)*sm;
+      const inc=this.rpm/120/sr;                      // 4행정: 2회전 = 1사이클
+      const p0=this.ph; this.ph+=inc; const wrap=this.ph>=1; if(wrap) this.ph-=1;
+      for(let j=0;j<this.ev.length;j++){
+        const e=this.ev[j], ep=(e.p+this.jit[j]+1)%1;
+        const hit = wrap ? (ep>=p0 || ep<this.ph) : (ep>=p0 && ep<this.ph);
+        if(!hit) continue;
+        // 공회전 캠 울렁임: 사이클마다 타이밍·세기 무작위 흔들림
+        this.jit[j]=(this.rnd()-0.5)*0.012*c.lope*idleness;
+        let a=e.a*(0.5+0.7*this.thr)*(1+(this.rnd()-0.5)*c.lope*idleness*0.8);
+        if(this.cut>0 && this.rnd()<0.7) a=0;         // 레브 리미터 점화 컷
+        if(overrun && this.pop>0){                     // 오프스로틀: 미스파이어 + 크래클
+          if(this.rnd()<0.22*this.pop){ a=0; if(this.rnd()<0.5) this.crk=0.9+this.rnd()*0.6; }
+          else a*=0.55;
+        }
+        this.env+=a;
+      }
+      const nz=this.rnd()*2-1;
+      let x=this.env*(0.7+0.3*nz); this.env*=dec;
+      if(this.crk>0.01){ x+=this.crk*nz*(this.rnd()<0.35?1.4:0.2); this.crk*=0.9965; }
+      // 배기 공명
+      let s=x*c.direct + this.biq(this.k1,this.b1,x)*2.2 + this.biq(this.k2,this.b2,x)*1.4;
+      // 배기관 콤필터
+      const d=this.buf[(this.w-this.L)&4095]; const v=s+d*c.fb; this.buf[this.w&4095]=v; this.w++; s=v;
+      // 포화 + 로우패스 2단
+      s=Math.tanh(s*drv*0.6)/tn;
+      this.lp1+=la*(s-this.lp1); this.lp2+=la*(this.lp1-this.lp2);
+      // DC 제거
+      const y=this.lp2-this.dcx+0.995*this.dcy; this.dcx=this.lp2; this.dcy=y;
+      out[i]=y*0.55;
+    }
+  }
+}`;
+
+const WORKLET_SRC = SYNTH_SRC + `
+class ExhaustProc extends AudioWorkletProcessor{
+  constructor(){ super(); this.s=new ExhaustSynth(sampleRate);
+    this.port.onmessage=e=>{ const m=e.data; if(m.cfg) this.s.setCfg(m.cfg,m.red); else this.s.set(m); }; }
+  process(_,outs){ const o=outs[0]; this.s.render(o[0],o[0].length); for(let c=1;c<o.length;c++) o[c].set(o[0]); return true; }
+}
+registerProcessor("exhaust",ExhaustProc);`;
+
+const Engine = {
+  ctx:null, n:null, vol:0.7, send:null,
+  async init(){
+    if(this.ctx) return;
+    const ctx=this.ctx=new (window.AudioContext||window.webkitAudioContext)();
+    const master=ctx.createGain(); master.gain.value=0;
+    // 저역 강조 EQ: 가슴 울림(70~90Hz) 올리고 거친 고역 정리
+    const low=ctx.createBiquadFilter(); low.type="lowshelf"; low.frequency.value=110; low.gain.value=7;
+    const mud=ctx.createBiquadFilter(); mud.type="peaking"; mud.frequency.value=450; mud.Q.value=1; mud.gain.value=-3;
+    const hi=ctx.createBiquadFilter(); hi.type="highshelf"; hi.frequency.value=3500; hi.gain.value=-6;
+    const comp=ctx.createDynamicsCompressor(); comp.threshold.value=-16; comp.ratio.value=3.5; comp.attack.value=0.005; comp.release.value=0.12;
+    low.connect(mud).connect(hi).connect(master).connect(comp).connect(ctx.destination);
+    let src;
+    try{
+      const url=URL.createObjectURL(new Blob([WORKLET_SRC],{type:"application/javascript"}));
+      await ctx.audioWorklet.addModule(url);
+      src=new AudioWorkletNode(ctx,"exhaust",{outputChannelCount:[1]});
+      this.send=m=>src.port.postMessage(m);
+    }catch(e){
+      // 구형 브라우저: ScriptProcessor로 같은 합성기 실행
+      const Synth=new Function(SYNTH_SRC+";return ExhaustSynth;")(), s=new Synth(ctx.sampleRate);
+      src=ctx.createScriptProcessor(1024,0,1);
+      src.onaudioprocess=ev=>s.render(ev.outputBuffer.getChannelData(0),ev.outputBuffer.length);
+      this.send=m=>m.cfg?s.setCfg(m.cfg,m.red):s.set(m);
+    }
+    src.connect(low);
+    // 과급기 휘슬 (터보/슈퍼차저 프리셋만)
+    const sc=ctx.createOscillator(); sc.type="sine"; const scG=ctx.createGain(); scG.gain.value=0;
+    sc.connect(scG).connect(master); sc.start();
+    this.n={master,sc,scG};
+  },
+  setPreset(P){ if(this.send) this.send({cfg:P.syn, red:P.red}); },
+  update(rpm, thr, P, popT, limiter){
+    if(!this.ctx||!this.send) return;
+    this.send({rpm, thr, pop:popT>0?P.pop:0, cut:limiter>0?1:0});
+    const t=this.ctx.currentTime, N=this.n;
+    if(P.turbo==="sc"){ N.sc.frequency.setTargetAtTime(900+rpm*0.55,t,0.05); N.scG.gain.setTargetAtTime(0.006+thr*0.01,t,0.1); }
+    else if(P.turbo==="turbo"){ N.sc.frequency.setTargetAtTime(2200+rpm*0.8,t,0.25); N.scG.gain.setTargetAtTime(thr*Math.min(1,rpm/4500)*0.01,t,0.3); }
+    else N.scG.gain.setTargetAtTime(0,t,0.1);
+    N.master.gain.setTargetAtTime(this.vol,t,0.1);
+  },
+  stop(){ if(this.ctx) this.n.master.gain.setTargetAtTime(0,this.ctx.currentTime,0.15); }
+};
+/* =========================================================
+   5. 계기판 렌더링 (Canvas)
+   ========================================================= */
+const cv=document.getElementById("dash"), g2=cv.getContext("2d");
+let W=0,H=0;
+function resize(){
+  const dpr=window.devicePixelRatio||1, w=cv.clientWidth;
+  const h=Math.min(w*0.46, window.innerHeight*0.68, 620);
+  cv.style.height=h+"px"; cv.width=w*dpr; cv.height=h*dpr; g2.setTransform(dpr,0,0,dpr,0,0); W=w; H=h;
+}
+window.addEventListener("resize",resize);
+function draw(st){
+  const P=Drive.P, c=g2; c.clearRect(0,0,W,H);
+  const cx=W/2, cy=H*0.55, R=Math.min(H*0.42,W*0.22);
+  const a0=Math.PI*0.75, a1=Math.PI*2.25, maxR=Math.ceil(P.red/1000)+1;
+  const ang=r=>a0+(a1-a0)*Math.min(1,r/(maxR*1000));
+  // 레드존
+  c.lineWidth=R*0.07; c.strokeStyle="rgba(255,77,46,.35)";
+  c.beginPath(); c.arc(cx,cy,R,ang(P.red),a1); c.stroke();
+  // 눈금
+  for(let k=0;k<=maxR*10;k++){
+    const a=ang(k*100), major=k%10===0, r1=R*(major?0.86:0.92);
+    c.strokeStyle=k*100>=P.red?"#ff4d2e":(major?"#cfd6de":"#3a4452"); c.lineWidth=major?2.5:1.2;
+    c.beginPath(); c.moveTo(cx+Math.cos(a)*r1,cy+Math.sin(a)*r1); c.lineTo(cx+Math.cos(a)*R*0.98,cy+Math.sin(a)*R*0.98); c.stroke();
+    if(major){ c.fillStyle=k*100>=P.red?"#ff4d2e":"#9aa6b4"; c.font=`600 ${R*0.11}px Saira Condensed,sans-serif`; c.textAlign="center"; c.textBaseline="middle";
+      c.fillText(k/10,cx+Math.cos(a)*R*0.74,cy+Math.sin(a)*R*0.74); }
+  }
+  // RPM 진행 호
+  const grad=c.createLinearGradient(cx-R,0,cx+R,0); grad.addColorStop(0,"#ffb020"); grad.addColorStop(1,"#ff4d2e");
+  c.strokeStyle=grad; c.lineWidth=R*0.045; c.lineCap="round";
+  c.beginPath(); c.arc(cx,cy,R*1.06,a0,ang(Drive.rpm)); c.stroke(); c.lineCap="butt";
+  // 바늘
+  const na=ang(Drive.rpm); c.strokeStyle="#ff4d2e"; c.lineWidth=3;
+  c.beginPath(); c.moveTo(cx+Math.cos(na)*R*0.55,cy+Math.sin(na)*R*0.55); c.lineTo(cx+Math.cos(na)*R*1.0,cy+Math.sin(na)*R*1.0); c.stroke();
+  // 속도
+  c.fillStyle="#e8edf2"; c.textAlign="center"; c.textBaseline="alphabetic";
+  c.font=`800 ${R*0.62}px Saira Condensed,sans-serif`; c.fillText(Math.round(st.v*3.6),cx,cy+R*0.18);
+  c.fillStyle="#7d8896"; c.font=`600 ${R*0.1}px Saira Condensed,sans-serif`; c.fillText("km/h",cx,cy+R*0.33);
+  c.font=`600 ${R*0.13}px Saira Condensed,sans-serif`; c.fillStyle="#cfd6de";
+  c.fillText(Math.round(Drive.rpm).toLocaleString()+" rpm",cx,cy+R*0.55);
+  // 기어 (왼쪽)
+  const lx=cx-R*1.75;
+  c.fillStyle=Drive.rpm>P.red*0.9?"#ff4d2e":"#e8edf2"; c.font=`800 ${R*0.55}px Saira Condensed,sans-serif`;
+  c.fillText(st.v<0.3&&Drive.thr<0.05?"N":Drive.gear,lx,cy+R*0.1);
+  c.fillStyle="#7d8896"; c.font=`600 ${R*0.09}px Noto Sans KR,sans-serif`; c.fillText("기어",lx,cy+R*0.3);
+  // 스로틀 바
+  const bw=R*0.7, bx=lx-bw/2, by=cy+R*0.55;
+  c.fillStyle="#1f2630"; c.fillRect(bx,by,bw,6); c.fillStyle="#ff4d2e"; c.fillRect(bx,by,bw*Drive.thr,6);
+  c.fillStyle="#7d8896"; c.fillText("스로틀(추정)",lx,by+R*0.18);
+  // G 미터 (오른쪽)
+  const gx=cx+R*1.75, gy=cy-R*0.05, gr=R*0.42;
+  c.strokeStyle="#2a323d"; c.lineWidth=1;
+  [1,0.5].forEach(f=>{ c.beginPath(); c.arc(gx,gy,gr*f,0,Math.PI*2); c.stroke(); });
+  c.beginPath(); c.moveTo(gx-gr,gy); c.lineTo(gx+gr,gy); c.moveTo(gx,gy-gr); c.lineTo(gx,gy+gr); c.stroke();
+  const gL=st.a/9.81, gT=st.lat/9.81, clamp=x=>Math.max(-1,Math.min(1,x));
+  c.fillStyle="#ff4d2e"; c.beginPath(); c.arc(gx+clamp(gT)*gr,gy-clamp(gL)*gr,5,0,Math.PI*2); c.fill();
+  c.fillStyle="#cfd6de"; c.font=`600 ${R*0.12}px Saira Condensed,sans-serif`;
+  c.fillText((gL>=0?"+":"")+gL.toFixed(2)+" g",gx,gy+gr+R*0.2);
+  // 수온 (가상)
+  c.fillStyle="#7d8896"; c.font=`600 ${R*0.09}px Noto Sans KR,sans-serif`;
+  c.fillText("수온(가상) "+Math.round(Drive.coolant)+"℃",gx,gy+gr+R*0.38);
+  // 상단 프리셋명
+  c.fillStyle="#7d8896"; c.font=`600 ${R*0.1}px Noto Sans KR,sans-serif`; c.fillText(P.name,cx,H*0.07+R*0.05);
+}
+
+/* =========================================================
+   6. 앱 상태 / 메인 루프
+   ========================================================= */
+const ui=id=>document.getElementById(id);
+function setStatus(html){ ui("status").innerHTML=html; }
+let mode="gps", running=false, gpsState={v:0,a:0,lat:0,ts:0,acc:null};
+const demo={v:0,a:0,gas:false,brk:false,auto:false,t:0};
+
+SpeedSource.onUpdate(s=>{
+  gpsState=s;
+  setStatus(`GPS <b>${(s.v*3.6).toFixed(1)} km/h</b> · 가속 ${s.a.toFixed(2)} m/s² · 정확도 ±${Math.round(s.acc)} m`);
+});
+
+function demoStep(dt){
+  demo.t+=dt;
+  let thr=demo.gas?1:0, brk=demo.brk?1:0;
+  if(demo.auto){                              // 18초 주기: 풀가속 → 감속 → 크루즈
+    const p=demo.t%18;
+    thr=p<7?1:(p<10?0:(p<14?0.25:0)); brk=p>=14&&p<17?0.6:0;
+  }
+  const P=Drive.P, ratio=P.ratios[Drive.gear-1]/P.ratios[0];
+  const accel=thr*6.5*Math.max(0.25,ratio)-(0.15+0.00045*demo.v*demo.v)-brk*8;
+  demo.a+= (accel-demo.a)*Math.min(1,dt*6);
+  demo.v=Math.max(0,demo.v+demo.a*dt);
+  if(demo.v===0 && demo.a<0) demo.a=0;
+  return {v:demo.v,a:demo.a,lat:0,thr};
+}
+
+let last=performance.now();
+function loop(now){
+  const dt=Math.min(0.05,(now-last)/1000); last=now;
+  let st;
+  if(mode==="demo"){ const d=demoStep(dt); st=d; Drive.update(d.v,d.thr,dt); }
+  else{
+    // GPS는 보통 1Hz → 최대 1.5초까지 가속도로 보간
+    const age=Math.min(1.5,(now-gpsState.ts)/1000);
+    const v=gpsState.ts?Math.max(0,gpsState.v+gpsState.a*age):0;
+    st={v,a:gpsState.a,lat:gpsState.lat};
+    Drive.update(v,Drive.estThrottle(v,gpsState.a),dt);
+  }
+  if(running) Engine.update(Drive.rpm,Drive.thr,Drive.P,Drive.popT,Drive.limiter);
+  draw(st);
+  requestAnimationFrame(loop);
+}
+
+/* =========================================================
+   7. UI 연결
+   ========================================================= */
+const sel=ui("preset");
+for(const [k,p] of Object.entries(PRESETS)){ const o=document.createElement("option"); o.value=k; o.textContent=p.name; sel.appendChild(o); }
+try{ const saved=localStorage.getItem("revdash.preset"); if(saved&&PRESETS[saved]) sel.value=saved; }catch(e){}
+Drive.setPreset(sel.value);
+sel.onchange=()=>{ Drive.setPreset(sel.value); Engine.setPreset(Drive.P); try{localStorage.setItem("revdash.preset",sel.value);}catch(e){} };
+ui("vol").oninput=e=>{ Engine.vol=+e.target.value; };
+
+let wakeLock=null;
+ui("start").onclick=async()=>{
+  if(!running){
+    await Engine.init(); Engine.setPreset(Drive.P); await Engine.ctx.resume();
+    running=true; Drive.coolant=62; ui("start").textContent="시동 끄기";
+    if(mode==="gps"){ setStatus("GPS 신호 대기 중…"); SpeedSource.start(); } else setStatus("시험 주행 · 가속/브레이크 버튼을 길게 누르세요");
+    try{ wakeLock=await navigator.wakeLock?.request("screen"); }catch(e){}
+  }else{
+    running=false; Engine.stop(); SpeedSource.stop(); ui("start").textContent="엔진 시동"; setStatus("시동 꺼짐");
+    try{ wakeLock?.release(); }catch(e){}
+  }
+};
+function setMode(m){
+  mode=m; ui("modeGps").classList.toggle("on",m==="gps"); ui("modeDemo").classList.toggle("on",m==="demo");
+  ui("pedals").hidden=m!=="demo";
+  if(m==="demo"){ SpeedSource.stop(); if(running) setStatus("시험 주행 · 가속/브레이크 버튼을 길게 누르세요"); }
+  else if(running){ SpeedSource.start(); setStatus("GPS 신호 대기 중…"); }
+}
+ui("modeGps").onclick=()=>setMode("gps");
+ui("modeDemo").onclick=()=>setMode("demo");
+function holdBtn(id,key){
+  const b=ui(id), on=e=>{e.preventDefault(); demo[key]=true; demo.auto=false; ui("auto").classList.remove("on"); b.classList.add("held");},
+        off=()=>{demo[key]=false; b.classList.remove("held");};
+  b.addEventListener("pointerdown",on); ["pointerup","pointerleave","pointercancel"].forEach(ev=>b.addEventListener(ev,off));
+}
+holdBtn("gas","gas"); holdBtn("brk","brk");
+ui("auto").onclick=()=>{ demo.auto=!demo.auto; demo.t=0; ui("auto").classList.toggle("on",demo.auto); };
+addEventListener("keydown",e=>{ if(mode!=="demo")return; if(e.key==="ArrowUp")demo.gas=true; if(e.key==="ArrowDown")demo.brk=true; if(e.key===" "){Drive.blip=0.25;e.preventDefault();} });
+addEventListener("keyup",e=>{ if(e.key==="ArrowUp")demo.gas=false; if(e.key==="ArrowDown")demo.brk=false; });
+ui("fs").onclick=()=>{ const d=document.documentElement; (document.fullscreenElement?document.exitFullscreen():d.requestFullscreen?.())?.catch?.(()=>{}); };
+
+resize(); requestAnimationFrame(loop);
+</script>
+</body>
+</html>
